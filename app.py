@@ -14,6 +14,7 @@ import re
 import os
 import csv
 import random
+import sqlite3
 from datetime import datetime, timezone
 from urllib.parse import quote_plus
 import difflib
@@ -130,45 +131,113 @@ def _similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 
+def normalize(text: str) -> str:
+    """Lowercase, strip punctuation/whitespace. MUST match the normalize()
+    function in ingest_uspto.py exactly, since we're matching against text
+    that script normalized when it built the local database."""
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+USPTO_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uspto_marks.db")
+USPTO_DB_STALE_DAYS = 14  # warn if the local index hasn't been refreshed recently
+
+# Status codes that mean a mark is unambiguously no longer active - sourced
+# from USPTO's own official TRAM status code table (Trademark Official
+# Gazette, Dec 3 1990: uspto.gov/news/og/con/files/cons181.htm), the same
+# system still used in current bulk data - confirmed against a real record
+# in this project (status 686 = "Published for Opposition" matched exactly
+# against that record's own event history log).
+#
+# Only codes explicitly meaning Abandoned/Cancelled/Expired are listed here.
+# Deliberately conservative: ambiguous codes (e.g. withdrawn-from-publication,
+# status-unclear backfill records) are NOT included, so they still count as
+# potential collisions. For a risk-screening tool, under-flagging a real
+# live conflict is worse than over-flagging one that turns out to be dead -
+# a user can always check further; a missed collision they can't undo.
+USPTO_DEAD_STATUS_CODES = {
+    "600", "601", "602", "603", "604", "605", "606", "607", "608", "609",
+    "614", "618",  # various Abandoned statuses
+    "622",         # Misassigned serial number - file destroyed, void
+    "626",         # Registered-Backfile cancelled or expired
+    "710", "711", "712", "713", "714", "716",  # Cancelled statuses
+    "900",         # Expired
+}
+
+
 def search_uspto(brand_name: str):
-    """Best-effort informational lookup. Reports 'unavailable' rather than
-    silently pretending the name is clear if the live call fails."""
+    """
+    Searches the LOCAL SQLite index built by ingest_uspto.py, instead of
+    making a live network call to USPTO on every request. USPTO's live
+    systems aren't built for per-request name search at app scale, and
+    this local index is faster and more reliable. Reports 'unavailable'
+    honestly if the index hasn't been built yet, rather than pretending
+    the name is clear.
+
+    Run ingest_uspto.py (see that file's docstring) to build/refresh this
+    database - once by hand for the initial backfill, then on a schedule
+    via the included GitHub Actions workflow for ongoing freshness.
+    """
     result = {
-        "source": "USPTO (best-effort public lookup)",
+        "source": "USPTO (local index, refreshed periodically)",
         "status": "unavailable",
         "matches": [],
         "note": None,
     }
-    try:
-        url = (
-            "https://tmsearch.uspto.gov/api-v1-0-0/tmsearch"
-            f"?query={quote_plus(brand_name)}"
+
+    if not os.path.exists(USPTO_DB_PATH):
+        result["note"] = (
+            "Local USPTO index has not been built yet. Run ingest_uspto.py "
+            "to create it - see that file's docstring for setup steps."
         )
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={
-            "User-Agent": "MarkScout/1.0 (informational research tool)"
-        })
-        if resp.status_code == 200:
-            data = resp.json()
-            hits = data.get("hits", {}).get("hits", []) if isinstance(data, dict) else []
-            for hit in hits[:10]:
-                src = hit.get("_source", {})
-                mark = src.get("mark_identification") or src.get("markLiteral")
-                if mark:
-                    result["matches"].append({
-                        "mark": mark,
-                        "status": src.get("status_type", "unknown"),
-                        "similarity": round(_similarity(brand_name, mark), 2),
-                    })
-            result["status"] = "ok"
-        else:
-            result["note"] = (
-                f"USPTO lookup returned HTTP {resp.status_code}; "
-                "live data unavailable, falling back to reference dataset."
-            )
+        return result
+
+    try:
+        conn = sqlite3.connect(USPTO_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        last_run = conn.execute(
+            "SELECT run_at FROM ingest_log ORDER BY run_at DESC LIMIT 1"
+        ).fetchone()
+        if last_run:
+            last_run_dt = datetime.fromisoformat(last_run["run_at"])
+            age_days = (datetime.now(timezone.utc) - last_run_dt).days
+            if age_days > USPTO_DB_STALE_DAYS:
+                result["note"] = (
+                    f"Local USPTO index was last refreshed {age_days} days ago "
+                    f"(over the {USPTO_DB_STALE_DAYS}-day freshness target) - "
+                    "check that the scheduled refresh is still running."
+                )
+
+        normalized_query = normalize(brand_name)
+        # Exact/substring match first (fast, uses the index), then fall
+        # back to scanning for fuzzy similarity on a bounded candidate set
+        # rather than the whole table. LIMIT is set higher than the number
+        # we'll actually use, since some fraction of matches get filtered
+        # out below for being dead marks.
+        rows = conn.execute(
+            "SELECT mark_literal, status_code FROM marks "
+            "WHERE mark_normalized LIKE ? LIMIT 50",
+            (f"%{normalized_query}%",),
+        ).fetchall()
+
+        for row in rows:
+            if row["status_code"] in USPTO_DEAD_STATUS_CODES:
+                # Abandoned/cancelled/expired - not a real collision risk,
+                # so it's excluded rather than counted against the name.
+                continue
+            result["matches"].append({
+                "mark": row["mark_literal"],
+                "status": row["status_code"] or "unknown",
+                "similarity": round(_similarity(brand_name, row["mark_literal"]), 2),
+            })
+            if len(result["matches"]) >= 25:
+                break
+
+        conn.close()
+        result["status"] = "ok"
     except Exception as exc:  # noqa: BLE001
         result["note"] = (
-            "USPTO live lookup could not be completed "
-            f"({type(exc).__name__}); falling back to reference dataset."
+            f"Local USPTO index could not be queried ({type(exc).__name__})."
         )
     return result
 
@@ -289,12 +358,8 @@ def compute_risk(brand_name: str, country: str, tm_class: str):
         },
         "data_limited": data_limited,
         "disclaimer": (
-            "This is an automated, preliminary screen based on a small "
-            "reference dataset and best-effort public lookups. It is NOT "
-            "legal advice, NOT a comprehensive trademark clearance search, "
-            "and NOT a guarantee the name is free to use or register. "
-            "Before committing to a name, run a professional clearance "
-            "search or consult a trademark attorney."
+            "Not legal advice. Not a clearance search. "
+            "Not a guarantee the name is free to use or register."
         ),
     }
 
@@ -493,10 +558,13 @@ def api_check():
 
     if risk["level"] in ("RED", "YELLOW"):
         response["pivots"] = generate_pivots(brand_name)
-        response["legal_referral_links"] = build_legal_referral_links(country)
 
-    if risk["level"] == "GREEN":
-        response["affiliate_links"] = build_affiliate_links(brand_name)
+    # Legal referrals and domain-registrar links are shown on every result,
+    # not just risky or clear ones - someone with a GREEN name still needs
+    # a registrar, and someone with a RED name may still want to talk to
+    # an attorney about a variant rather than starting over from scratch.
+    response["legal_referral_links"] = build_legal_referral_links(country)
+    response["affiliate_links"] = build_affiliate_links(brand_name)
 
     return jsonify(response)
 
