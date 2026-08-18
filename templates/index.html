@@ -185,9 +185,8 @@
   .verdict-headline { color: var(--text-muted); font-size: 0.95rem; margin-bottom: 4px; }
   .verdict-reasons { margin-top: 12px; padding-left: 18px; }
   .verdict-reasons li { color: var(--text-muted); font-size: 0.88rem; margin-bottom: 5px; }
-  .data-limited-note { margin-top: 14px; font-family: var(--font-mono); font-size: 0.76rem; color: var(--text-faint); border-top: 1px solid var(--border-hair); padding-top: 12px; }
 
-  .legal-card h3, .sources-card h3, .pivot-card h3, .domain-card h3 {
+  .legal-card h3, .pivot-card h3, .domain-card h3, .referral-card h3 {
     font-family: var(--font-display); font-weight: 600; font-size: 1rem; margin-bottom: 14px;
     display: flex; align-items: center; gap: 8px; color: var(--ink);
   }
@@ -195,10 +194,6 @@
   .legal-section:last-child { margin-bottom: 0; }
   .legal-section .sec-label { font-family: var(--font-mono); font-size: 0.78rem; color: var(--accent); margin-bottom: 3px; }
   .legal-section .sec-text { font-size: 0.9rem; color: var(--text-muted); }
-
-  .sources-list { list-style: none; display: flex; flex-direction: column; gap: 8px; }
-  .sources-list li { font-family: var(--font-mono); font-size: 0.82rem; color: var(--text-muted); display: flex; gap: 8px; align-items: baseline; }
-  .sources-list .status-chip { font-size: 0.68rem; padding: 2px 8px; border-radius: 999px; flex-shrink: 0; background: var(--bg-surface-2); color: var(--text-faint); text-transform: uppercase; }
 
   .disclaimer-box { font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-faint); background: var(--bg-surface-2); border-radius: var(--radius-md); padding: 16px 20px; border: 1px solid var(--border-hair); }
 
@@ -246,8 +241,7 @@
   .gate-error.show { display: block; }
   .gate-note { font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-faint); margin-top: 12px; }
 
-  /* ---------- Referral links (RED/YELLOW) ---------- */
-  .referral-card h3 { color: var(--ink); }
+  /* ---------- Referral links (shown on every result) ---------- */
   .referral-note { color: var(--text-faint); font-size: 0.82rem; margin-bottom: 16px; }
   .referral-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
   .referral-btn {
@@ -929,10 +923,6 @@ function renderResults(data) {
     data.risk.reasons.forEach(r => ul.appendChild(el('li', '', escapeHtml(r))));
     verdict.appendChild(ul);
   }
-  if (data.risk.data_limited) {
-    verdict.appendChild(el('div', 'data-limited-note',
-      '⚠ One or more live registry lookups could not complete for this query — this result leans partly on the reference dataset. Treat it as directional, not conclusive.'));
-  }
   results.appendChild(verdict);
 
   if (data.legal_context.cited_sections.length) {
@@ -946,20 +936,6 @@ function renderResults(data) {
     });
     results.appendChild(legal);
   }
-
-  const sources = data.risk.sources_checked;
-  const srcCard = el('div', 'card sources-card');
-  srcCard.appendChild(el('h3', '', '🔍 Sources checked'));
-  const list = el('ul', 'sources-list');
-  if (sources.uspto) {
-    list.appendChild(el('li', '', `<span class="status-chip">${sources.uspto.status}</span> USPTO ${sources.uspto.note ? '— ' + escapeHtml(sources.uspto.note) : ''}`));
-  }
-  if (sources.ip_india) {
-    list.appendChild(el('li', '', `<span class="status-chip">${sources.ip_india.status}</span> IP India ${sources.ip_india.note ? '— ' + escapeHtml(sources.ip_india.note) : ''}`));
-  }
-  list.appendChild(el('li', '', `<span class="status-chip">static</span> ${escapeHtml(sources.reference_dataset.source)}`));
-  srcCard.appendChild(list);
-  results.appendChild(srcCard);
 
   results.appendChild(el('div', 'disclaimer-box', escapeHtml(data.risk.disclaimer)));
 
